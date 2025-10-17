@@ -17,11 +17,46 @@
 
 
 import os
+import mimetypes
 import boto3
 import logging
-from urllib.parse import urlparse, quote
+from urllib.parse import quote
+
+DEFAULT_CONTENT_TYPE = 'application/octet-stream'
+GENERIC_CONTENT_TYPES = {DEFAULT_CONTENT_TYPE, 'binary/octet-stream'}
+
+# Register additional common MIME types that mimetypes may not know about by default.
+mimetypes.add_type('application/x-subrip', '.srt')
+
 
 logger = logging.getLogger(__name__)
+
+def _clean_content_type_value(value):
+    if not value:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _is_generic_content_type(value):
+    if not value:
+        return True
+    base_type = value.split(';', 1)[0].strip().lower()
+    return base_type in GENERIC_CONTENT_TYPES
+
+
+def resolve_content_type(filename, provided_content_type=None):
+    """Resolve the most appropriate Content-Type for an upload."""
+    provided = _clean_content_type_value(provided_content_type)
+    if provided and not _is_generic_content_type(provided):
+        return provided
+
+    guessed, _ = mimetypes.guess_type(filename)
+    if guessed:
+        return guessed
+
+    return DEFAULT_CONTENT_TYPE
+
 
 def upload_to_s3(file_path, s3_url, access_key, secret_key, bucket_name, region):
     # Parse the S3 URL into bucket, region, and endpoint
@@ -38,7 +73,14 @@ def upload_to_s3(file_path, s3_url, access_key, secret_key, bucket_name, region)
     try:
         # Upload the file to the specified S3 bucket
         with open(file_path, 'rb') as data:
-            client.upload_fileobj(data, bucket_name, os.path.basename(file_path), ExtraArgs={'ACL': 'public-read'})
+            filename = os.path.basename(file_path)
+            content_type = resolve_content_type(filename)
+            client.upload_fileobj(
+                data,
+                bucket_name,
+                filename,
+                ExtraArgs={'ACL': 'public-read', 'ContentType': content_type}
+            )
 
         # URL encode the filename for the URL
         encoded_filename = quote(os.path.basename(file_path))
