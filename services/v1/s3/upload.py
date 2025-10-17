@@ -19,9 +19,12 @@ import os
 import boto3
 import logging
 import requests
+from contextlib import closing
 from urllib.parse import urlparse, unquote, quote
 import uuid
 # import re # This import was not used, can be removed if not needed elsewhere
+
+from services.s3_toolkit import resolve_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -106,86 +109,85 @@ def stream_upload_to_s3(file_url, custom_filename=None, make_public=False):
         else:
             filename = get_filename_from_url(file_url)
         
-        # Start a multipart upload
-        logger.info(f"Starting multipart upload for {filename} to bucket {bucket_name}")
-        
-        # --- MODIFICATION START ---
-        # Removed ACL from create_multipart_upload
-        # The ACL parameter was likely causing the "InvalidArgument" error with GCS.
-        # GCS generally prefers IAM permissions over S3 ACLs, or ACLs set after upload.
-        multipart_upload = s3_client.create_multipart_upload(
-            Bucket=bucket_name,
-            Key=filename
-            # ACL=acl # Removed this line
-        )
-        # --- MODIFICATION END ---
-        
-        upload_id = multipart_upload['UploadId']
-        
+        upload_id = None
+
         # Stream the file from URL
         # Adding a timeout and User-Agent is good practice for HTTP requests
         headers = {'User-Agent': 'NCAToolkit/1.0'}
-        response = requests.get(file_url, stream=True, timeout=30, headers=headers) # 30-second timeout
-        response.raise_for_status() # Raises an HTTPError for bad responses (4XX or 5XX)
-        
-        # Process in chunks using multipart upload
-        # GCS (like S3) requires parts to be at least 5MB, except for the last part.
-        chunk_size_for_s3_part = 5 * 1024 * 1024  # 5MB
-        parts = []
-        part_number = 1
-        
-        buffer = bytearray()
-        
-        # Read from stream in smaller chunks, accumulate up to S3 part size
-        for http_chunk in response.iter_content(chunk_size=1 * 1024 * 1024):  # Read 1MB at a time from HTTP stream
-            if http_chunk: # filter out keep-alive new chunks
-                buffer.extend(http_chunk)
-            
-            # When we have enough data for an S3 part, or if the stream is ending and there's data
-            while len(buffer) >= chunk_size_for_s3_part:
-                current_part_data = buffer[:chunk_size_for_s3_part]
-                buffer = buffer[chunk_size_for_s3_part:]
+        with closing(requests.get(file_url, stream=True, timeout=30, headers=headers)) as response:  # 30-second timeout
+            response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
 
-                logger.info(f"Uploading part {part_number} (size: {len(current_part_data)} bytes)")
+            content_type = resolve_content_type(filename, response.headers.get('Content-Type'))
+            logger.info(f"Resolved content type '{content_type}' for {filename}")
+
+            # Start a multipart upload with the resolved content type
+            logger.info(f"Starting multipart upload for {filename} to bucket {bucket_name}")
+            multipart_upload = s3_client.create_multipart_upload(
+                Bucket=bucket_name,
+                Key=filename,
+                ContentType=content_type
+            )
+
+            upload_id = multipart_upload['UploadId']
+
+            # Process in chunks using multipart upload
+            # GCS (like S3) requires parts to be at least 5MB, except for the last part.
+            chunk_size_for_s3_part = 5 * 1024 * 1024  # 5MB
+            parts = []
+            part_number = 1
+
+            buffer = bytearray()
+
+            # Read from stream in smaller chunks, accumulate up to S3 part size
+            for http_chunk in response.iter_content(chunk_size=1 * 1024 * 1024):  # Read 1MB at a time from HTTP stream
+                if http_chunk:  # filter out keep-alive new chunks
+                    buffer.extend(http_chunk)
+
+                # When we have enough data for an S3 part, or if the stream is ending and there's data
+                while len(buffer) >= chunk_size_for_s3_part:
+                    current_part_data = buffer[:chunk_size_for_s3_part]
+                    buffer = buffer[chunk_size_for_s3_part:]
+
+                    logger.info(f"Uploading part {part_number} (size: {len(current_part_data)} bytes)")
+                    part = s3_client.upload_part(
+                        Bucket=bucket_name,
+                        Key=filename,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=current_part_data
+                    )
+
+                    parts.append({
+                        'PartNumber': part_number,
+                        'ETag': part['ETag']
+                    })
+
+                    part_number += 1
+
+            # Upload any remaining data as the final part
+            if buffer:  # If there's anything left in the buffer, it's the last part
+                logger.info(f"Uploading final part {part_number} (size: {len(buffer)} bytes)")
                 part = s3_client.upload_part(
                     Bucket=bucket_name,
                     Key=filename,
                     PartNumber=part_number,
                     UploadId=upload_id,
-                    Body=current_part_data
+                    Body=buffer  # Send the remainder
                 )
-                
+
                 parts.append({
                     'PartNumber': part_number,
                     'ETag': part['ETag']
                 })
-                
-                part_number += 1
-        
-        # Upload any remaining data as the final part
-        if buffer: # If there's anything left in the buffer, it's the last part
-            logger.info(f"Uploading final part {part_number} (size: {len(buffer)} bytes)")
-            part = s3_client.upload_part(
+
+            # Complete the multipart upload
+            logger.info("Completing multipart upload")
+            s3_client.complete_multipart_upload(
                 Bucket=bucket_name,
                 Key=filename,
-                PartNumber=part_number,
                 UploadId=upload_id,
-                Body=buffer # Send the remainder
+                MultipartUpload={'Parts': parts}
             )
-            
-            parts.append({
-                'PartNumber': part_number,
-                'ETag': part['ETag']
-            })
-        
-        # Complete the multipart upload
-        logger.info("Completing multipart upload")
-        s3_client.complete_multipart_upload(
-            Bucket=bucket_name,
-            Key=filename,
-            UploadId=upload_id,
-            MultipartUpload={'Parts': parts}
-        )
 
         # --- ACL MODIFICATION SUGGESTION ---
         # If you need to make the object public, do it *after* the upload is complete.
@@ -244,12 +246,12 @@ def stream_upload_to_s3(file_url, custom_filename=None, make_public=False):
         logger.error(f"Generic error streaming file to S3: {e}")
         # Attempt to abort the multipart upload if it was initiated (if applicable for generic errors too)
         if 's3_client' in locals() and 'bucket_name' in locals() and 'filename' in locals() and 'upload_id' in locals() and upload_id:
-             try:
+            try:
                 logger.info(f"Attempting to abort failed multipart upload {upload_id} due to generic error.")
                 s3_client.abort_multipart_upload(
                     Bucket=bucket_name, Key=filename, UploadId=upload_id
                 )
                 logger.info(f"Successfully aborted multipart upload {upload_id}")
-             except Exception as e_abort:
+            except Exception as e_abort:
                 logger.error(f"Failed to abort multipart upload {upload_id}: {e_abort}")
         raise
